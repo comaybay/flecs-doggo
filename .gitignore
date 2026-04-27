@@ -10,3 +10,4 @@ docs/html
 MODULE.bazel.lock
 .*
 .*/*
+!.gdignore
