@@ -280,6 +280,9 @@ static bool flecs_pipeline_build(
 
     ecs_vec_reset_t(a, &pq->ops, ecs_pipeline_op_t);
     ecs_vec_reset_t(a, &pq->systems, ecs_system_t*);
+    /* [native_faith fork] a rebuild zeroes every op's counters below, so the
+     * measurement window restarts here. */
+    pq->counters_since_frame = world->info.frame_count_total;
 
     bool multi_threaded = false;
     bool immediate = false;
@@ -792,6 +795,138 @@ ecs_entity_t ecs_get_pipeline(
     return world->pipeline;
 error:
     return 0;
+}
+
+/* [native_faith fork] see ecs_pipeline_ops_str() in addons/pipeline.h. */
+char* ecs_pipeline_ops_str(
+    const ecs_world_t *world,
+    ecs_entity_t pipeline)
+{
+    ecs_check(world != NULL, ECS_INVALID_PARAMETER, NULL);
+    world = ecs_get_world(world);
+
+    if (!pipeline) {
+        pipeline = ecs_get_pipeline(world);
+    }
+    if (!pipeline) {
+        return NULL;
+    }
+
+    const EcsPipeline *p = ecs_get(world, pipeline, EcsPipeline);
+    if (!p || !p->state) {
+        return NULL;
+    }
+
+    ecs_pipeline_state_t *pq = p->state;
+    ecs_vec_t *ops = &pq->ops;
+    int32_t i, op_count = ecs_vec_count(ops);
+    int32_t sys_total = ecs_vec_count(&pq->systems);
+    int32_t barriers = 0;
+
+    for (i = 0; i < op_count; i ++) {
+        if (ecs_vec_get_t(ops, ecs_pipeline_op_t, i)->multi_threaded) {
+            barriers ++;
+        }
+    }
+
+    ecs_strbuf_t buf = ECS_STRBUF_INIT;
+    const char *pname = ecs_get_name(world, pipeline);
+    ecs_strbuf_appendlit(&buf, "pipeline '");
+    ecs_strbuf_appendstr(&buf, pname ? pname : "(unnamed)");
+    ecs_strbuf_appendlit(&buf, "': ops ");
+    ecs_strbuf_appendint(&buf, op_count);
+    ecs_strbuf_appendlit(&buf, ", multi_threaded ops ");
+    ecs_strbuf_appendint(&buf, barriers);
+    ecs_strbuf_appendlit(&buf, " (= worker barrier round trips per tick), systems ");
+    ecs_strbuf_appendint(&buf, sys_total);
+    ecs_strbuf_appendlit(&buf, ", stage_count ");
+    ecs_strbuf_appendint(&buf, ecs_get_stage_count(world));
+    ecs_strbuf_appendlit(&buf, ", rebuilds ");
+    ecs_strbuf_appendint(&buf, pq->rebuild_count);
+    ecs_strbuf_appendlit(&buf, ", frames_measured ");
+    ecs_strbuf_appendint(&buf,
+        ecs_get_world_info(world)->frame_count_total - pq->counters_since_frame);
+    ecs_strbuf_appendlit(&buf, "\n  NOTE: ACTIVE systems only -- a system whose query matches zero tables is"
+        " tagged EcsEmpty and excluded from the schedule, so this list shrinks when nothing"
+        " of a given kind is alive. merge_ms_total/commands_total cover exactly frames_measured"
+        " frames (since the last rebuild or ecs_pipeline_ops_reset_counters); divide by it for"
+        " per-tick cost.\n");
+
+    for (i = 0; i < op_count; i ++) {
+        ecs_pipeline_op_t *op = ecs_vec_get_t(ops, ecs_pipeline_op_t, i);
+        int32_t s;
+
+        ecs_strbuf_appendlit(&buf, "  op ");
+        ecs_strbuf_appendint(&buf, i);
+        ecs_strbuf_appendlit(&buf, " [");
+        ecs_strbuf_appendstr(&buf, op->multi_threaded ? "multi_threaded" : "serial");
+        if (op->immediate) {
+            ecs_strbuf_appendlit(&buf, ", immediate");
+        }
+        ecs_strbuf_appendlit(&buf, "] systems ");
+        ecs_strbuf_appendint(&buf, op->count);
+        ecs_strbuf_appendlit(&buf, ", commands_total ");
+        ecs_strbuf_appendint(&buf, op->commands_enqueued);
+        ecs_strbuf_appendlit(&buf, ", merge_ms_total ");
+        ecs_strbuf_append(&buf, "%.4f", op->time_spent * 1000.0);
+        ecs_strbuf_appendlit(&buf, "\n");
+
+        for (s = 0; s < op->count; s ++) {
+            int32_t si = op->offset + s;
+            ecs_system_t *sys;
+            const char *sys_name = NULL;
+            if (si >= sys_total) {
+                break;
+            }
+            /* pq->systems holds ecs_system_t*, not ecs_entity_t; the system's
+             * entity lives on its query (see flecs_run_pipeline_ops). */
+            sys = ecs_vec_get_t(&pq->systems, ecs_system_t*, si)[0];
+            if (sys && sys->query) {
+                sys_name = ecs_get_name(world, sys->query->entity);
+            }
+            ecs_strbuf_appendlit(&buf, "      ");
+            ecs_strbuf_appendstr(&buf, sys_name ? sys_name : "(unnamed system)");
+            ecs_strbuf_appendlit(&buf, "\n");
+        }
+    }
+
+    return ecs_strbuf_get(&buf);
+error:
+    return NULL;
+}
+
+/* [native_faith fork] see ecs_pipeline_ops_reset_counters() in addons/pipeline.h. */
+void ecs_pipeline_ops_reset_counters(
+    ecs_world_t *world,
+    ecs_entity_t pipeline)
+{
+    ecs_check(world != NULL, ECS_INVALID_PARAMETER, NULL);
+    const ecs_world_t *cworld = ecs_get_world(world);
+
+    if (!pipeline) {
+        pipeline = ecs_get_pipeline(cworld);
+    }
+    if (!pipeline) {
+        return;
+    }
+
+    const EcsPipeline *p = ecs_get(cworld, pipeline, EcsPipeline);
+    if (!p || !p->state) {
+        return;
+    }
+
+    ecs_pipeline_state_t *pq = p->state;
+    ecs_vec_t *ops = &pq->ops;
+    int32_t i, count = ecs_vec_count(ops);
+    for (i = 0; i < count; i ++) {
+        ecs_pipeline_op_t *op = ecs_vec_get_t(ops, ecs_pipeline_op_t, i);
+        op->time_spent = 0;
+        op->commands_enqueued = 0;
+    }
+
+    pq->counters_since_frame = ecs_get_world_info(cworld)->frame_count_total;
+error:
+    return;
 }
 
 static ecs_entity_t flecs_pipeline_init(

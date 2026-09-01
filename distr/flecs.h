@@ -3510,6 +3510,15 @@ FLECS_API extern int64_t ecs_os_api_realloc_count; /**< realloc count. */
 FLECS_API extern int64_t ecs_os_api_calloc_count;  /**< calloc count. */
 FLECS_API extern int64_t ecs_os_api_free_count;    /**< free count. */
 
+/** Cached result of ecs_os_has_threading(), refreshed whenever the OS API is
+ * (re)initialized (ecs_os_set_api, ecs_os_init, ecs_os_set_api_defaults).
+ * ecs_os_has_threading() tests twelve function pointers on every call, which is
+ * measurable when it sits in a hot path such as flecs_poly_claim_(). Hot code
+ * should read this flag; call ecs_os_has_threading() instead if the OS API may
+ * have been mutated directly since the last refresh.
+ * [native_faith fork] */
+FLECS_API extern bool ecs_os_api_has_threading_;
+
 /* Enabling this flag will add a header to each allocation that allows the code
  * to track exactly how much memory has been allocated. Increases memory 
  * utilization by 16 bytes per allocation, and is not thread-safe. */
@@ -14092,6 +14101,45 @@ void ecs_set_pipeline(
 FLECS_API
 ecs_entity_t ecs_get_pipeline(
     const ecs_world_t *world);
+
+/** Describe a pipeline's op (merge/sync point) schedule as a human readable string.
+ * [native_faith fork] Diagnostic for sizing worker-barrier cost. The scheduler splits
+ * a pipeline's systems into "ops"; every op whose \c multi_threaded flag is set costs
+ * one full worker barrier round trip per tick (flecs_signal_workers ->
+ * flecs_sync_worker -> flecs_wait_for_sync, i.e. a condvar broadcast plus a wait on
+ * every worker and on the main thread). The count of multi-threaded ops is therefore
+ * the number of barrier round trips per tick.
+ *
+ * Unlike the stats addon this needs no FLECS_STATS/FLECS_REST, so it can be called
+ * from a release build. The op schedule is built lazily, so call this only AFTER at
+ * least one ecs_progress()/world::progress(); before that the result is empty.
+ *
+ * \c commands_enqueued is always accumulated; \c merge_ms is only populated when
+ * ecs_measure_system_time() is enabled.
+ *
+ * @param world The world.
+ * @param pipeline The pipeline to describe, or 0 for the world's current pipeline.
+ * @return A newly allocated string (free with ecs_os_free), or NULL if the pipeline
+ *         does not exist or has not been built yet.
+ */
+FLECS_API
+char* ecs_pipeline_ops_str(
+    const ecs_world_t *world,
+    ecs_entity_t pipeline);
+
+/** Zero a pipeline's per-op counters and restart its measurement window.
+ * [native_faith fork] Resets every op's time_spent / commands_enqueued and stamps the
+ * current frame, so the next ecs_pipeline_ops_str() reports cost over exactly the frames
+ * since this call rather than a session average. Call it at the start of the interval you
+ * want to measure (e.g. just before ramping load), then dump at the end.
+ *
+ * @param world The world.
+ * @param pipeline The pipeline, or 0 for the world's current pipeline.
+ */
+FLECS_API
+void ecs_pipeline_ops_reset_counters(
+    ecs_world_t *world,
+    ecs_entity_t pipeline);
 
 /** Progress a world.
  * This operation progresses the world by running all systems that are both

@@ -25,6 +25,8 @@ int64_t ecs_os_api_malloc_count = 0;
 int64_t ecs_os_api_realloc_count = 0;
 int64_t ecs_os_api_calloc_count = 0;
 int64_t ecs_os_api_free_count = 0;
+/* [native_faith fork] cached ecs_os_has_threading(); see os_api.h. */
+bool ecs_os_api_has_threading_ = false;
 
 void ecs_os_set_api(
     ecs_os_api_t *os_api)
@@ -33,6 +35,8 @@ void ecs_os_set_api(
         ecs_os_api = *os_api;
         ecs_os_api_initialized = true;
     }
+
+    ecs_os_api_has_threading_ = ecs_os_has_threading(); /* [native_faith fork] */
 }
 
 ecs_os_api_t ecs_os_get_api(void) {
@@ -44,6 +48,8 @@ void ecs_os_init(void)
     if (!ecs_os_api_initialized) {
         ecs_os_set_api_defaults();
     }
+
+    ecs_os_api_has_threading_ = ecs_os_has_threading(); /* [native_faith fork] */
     
     if (!(ecs_os_api_init_count ++)) {
         if (ecs_os_api.init_) {
@@ -574,6 +580,8 @@ void ecs_os_set_api_defaults(void)
 #   endif
 
     ecs_os_api_initializing = false;
+
+    ecs_os_api_has_threading_ = ecs_os_has_threading(); /* [native_faith fork] */
 }
 
 bool ecs_os_has_heap(void) {

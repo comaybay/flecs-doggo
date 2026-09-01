@@ -27,6 +27,11 @@ struct ecs_pipeline_state_t {
     ecs_entity_t last_system;   /* Last system run by pipeline */
     int32_t match_count;        /* Used to track if rebuild is necessary */
     int32_t rebuild_count;      /* Number of pipeline rebuilds */
+    /* [native_faith fork] world frame at which op counters (time_spent /
+     * commands_enqueued) were last zeroed -- by a rebuild or by an explicit
+     * ecs_pipeline_ops_reset_counters(). Lets a dump report cost over a measured
+     * window instead of a session average. */
+    int64_t counters_since_frame;
 
     /* Members for continuing pipeline iteration after pipeline rebuild */
     ecs_pipeline_op_t *cur_op;  /* Current pipeline op */

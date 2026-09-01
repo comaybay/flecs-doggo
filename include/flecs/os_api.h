@@ -47,6 +47,15 @@ FLECS_API extern int64_t ecs_os_api_realloc_count; /**< realloc count. */
 FLECS_API extern int64_t ecs_os_api_calloc_count;  /**< calloc count. */
 FLECS_API extern int64_t ecs_os_api_free_count;    /**< free count. */
 
+/** Cached result of ecs_os_has_threading(), refreshed whenever the OS API is
+ * (re)initialized (ecs_os_set_api, ecs_os_init, ecs_os_set_api_defaults).
+ * ecs_os_has_threading() tests twelve function pointers on every call, which is
+ * measurable when it sits in a hot path such as flecs_poly_claim_(). Hot code
+ * should read this flag; call ecs_os_has_threading() instead if the OS API may
+ * have been mutated directly since the last refresh.
+ * [native_faith fork] */
+FLECS_API extern bool ecs_os_api_has_threading_;
+
 /* Enabling this flag will add a header to each allocation that allows the code
  * to track exactly how much memory has been allocated. Increases memory 
  * utilization by 16 bytes per allocation, and is not thread-safe. */

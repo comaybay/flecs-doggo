@@ -111,7 +111,7 @@ int32_t flecs_poly_claim_(
     ecs_header_t *hdr = poly;
     ecs_assert(hdr->type != 0, ECS_INVALID_PARAMETER,
         "invalid/freed pointer to flecs object detected");
-    if (ecs_os_has_threading()) {
+    if (ecs_os_api_has_threading_) { /* [native_faith fork] cached; was ecs_os_has_threading() */
         return ecs_os_ainc(&hdr->refcount);
     } else {
         return ++hdr->refcount;
@@ -125,7 +125,7 @@ int32_t flecs_poly_release_(
     ecs_header_t *hdr = poly;
     ecs_assert(hdr->type != 0, ECS_INVALID_PARAMETER,
         "invalid/freed pointer to flecs object detected");
-    if (ecs_os_has_threading()) {
+    if (ecs_os_api_has_threading_) { /* [native_faith fork] cached; was ecs_os_has_threading() */
         return ecs_os_adec(&hdr->refcount);
     } else {
         return --hdr->refcount;
