@@ -83860,8 +83860,12 @@ void flecs_query_revalidate_table(
      * flecs_query_cache_remove_table_from_group(), whose swap-remove looks the
      * displaced entry up by table->id == 0, gets NULL from
      * flecs_query_cache_get_table() and writes through it -> access violation in
-     * ecs_fini(). Every cache is freed moments later, so skipping revalidation
-     * here has no observable effect. */
+     * ecs_fini(). This is a shutdown-only safety tradeoff: cache revalidation is
+     * skipped while world cleanup is active, and callers must not rely on
+     * iterating cached queries from fini actions. EcsWorldQuit is also used by
+     * ecs_quit() as a loop-stop flag; this upstream flag conflation means the
+     * guard can suppress revalidation there as well, but this fork does not call
+     * ecs_quit() while keeping a world alive. */
     if (world->flags & EcsWorldQuit) {
         return;
     }
@@ -105044,4 +105048,3 @@ int flecs_expr_visit_type(
 }
 
 #endif
-
