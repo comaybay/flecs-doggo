@@ -300,6 +300,26 @@ void flecs_query_revalidate_table(
 {
     flecs_poly_assert(world, ecs_world_t);
 
+    /* [native_faith fork] Do not rematch query caches once the world is shutting
+     * down. ecs_fini() sets EcsWorldQuit *before* flecs_fini_roots() deletes the
+     * root entities, and flecs_table_fini() suppresses EcsOnTableDelete while
+     * that flag is set, so flecs_query_cache_on_event() never gets to call
+     * flecs_query_cache_remove_table() for the tables torn down in that pass.
+     * The cache is left holding ecs_query_cache_match_t entries whose
+     * base.table points at ecs_table_t structs that flecs_sparse_remove_w_gen()
+     * has already memset to zero. A rematch triggered later in the same pass
+     * (cascade/group_by queries such as the builtin and custom pipelines change
+     * group as their DependsOn depth collapses) reaches
+     * flecs_query_cache_move_table_to_group() ->
+     * flecs_query_cache_remove_table_from_group(), whose swap-remove looks the
+     * displaced entry up by table->id == 0, gets NULL from
+     * flecs_query_cache_get_table() and writes through it -> access violation in
+     * ecs_fini(). Every cache is freed moments later, so skipping revalidation
+     * here has no observable effect. */
+    if (world->flags & EcsWorldQuit) {
+        return;
+    }
+
     ecs_query_cache_t *cache = impl->cache;
     ecs_assert(cache != NULL, ECS_INTERNAL_ERROR, NULL);
 
