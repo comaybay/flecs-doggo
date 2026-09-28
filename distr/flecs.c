@@ -3804,7 +3804,15 @@ struct ecs_world_t {
     ecs_os_cond_t sync_cond;         /* Signal that worker thread job is done */
     ecs_os_mutex_t sync_mutex;       /* Mutex for job_cond */
     int32_t workers_running;         /* Number of threads running */
-    int32_t workers_waiting;         /* Number of workers waiting on sync */
+    /* Per-op worker barrier (dotu fork). The main thread releases the workers by bumping sync_epoch and
+     * collects them on sync_done; both sides SPIN briefly before parking on the condvars, so an op that
+     * follows another within microseconds -- every op of one pipeline run -- never touches sync_mutex.
+     * The *_parked counts are how each side knows the other is asleep and needs the condvar. All four
+     * are written with ecs_os_ainc/adec (full fences) -- the park handshake depends on that ordering. */
+    int32_t sync_epoch;
+    int32_t sync_done;
+    int32_t sync_parked;
+    int32_t sync_main_parked;
     ecs_pipeline_state_t* pq;        /* Pointer to the pipeline for the workers to execute */
     bool workers_use_task_api;       /* Workers are short-lived tasks, not long-running threads */
 
@@ -64802,7 +64810,7 @@ void flecs_run_pipeline(
         }
 
         ECS_BIT_COND(world->flags, EcsWorldMultiThreaded, op_multi_threaded);
-        ecs_assert(world->workers_waiting == 0, ECS_INTERNAL_ERROR, NULL);
+        ecs_assert(world->sync_done == 0, ECS_INTERNAL_ERROR, NULL);
 
         if (op_multi_threaded) {
             flecs_signal_workers(world);
@@ -65308,6 +65316,69 @@ void FlecsPipelineImport(
 
 #ifdef FLECS_PIPELINE
 
+/* -- Worker barrier (dotu fork) --------------------------------------------------------------------------
+ *
+ * WHY. Upstream synchronised every multi_threaded op with a condvar broadcast plus a mutex that every worker
+ * took twice (wake, then report done), and a second condvar for the main thread. That is a lock convoy and N
+ * OS wakeups per op. Measured on a 24-thread box with 14 stages: an EMPTY world cost 0.93 ms/tick against
+ * 0.08 ms single-threaded -- the barrier, ~65 us per op, 13 ops per tick -- and a 600-unit battle spent 1.3
+ * of its 1.97 ms in progress() outside every system.
+ *
+ * HOW. The main thread releases the workers by bumping sync_epoch and collects them on sync_done. Each side
+ * spins for a bounded number of pauses first (ops of one pipeline run are microseconds apart), and only then
+ * parks on its condvar, announcing it in *_parked so the other side knows to signal.
+ *
+ * 🚨 THE PARK HANDSHAKE IS A DEKKER PAIR and is only correct because every write below is ecs_os_ainc /
+ * ecs_os_adec (a full fence): the parker increments its *_parked count THEN re-reads the condition; the
+ * releaser changes the condition THEN reads *_parked. With both fenced, at least one of them sees the
+ * other's write, so a release can never slip between "checked, not ready" and "asleep". Replacing either
+ * with a plain store loses a wakeup and hangs the pipeline -- intermittently.
+ */
+#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+#include <intrin.h>
+#define FLECS_SYNC_PAUSE() _mm_pause()
+#elif defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#define FLECS_SYNC_PAUSE() _mm_pause()
+#elif defined(__aarch64__) || defined(__arm__)
+#define FLECS_SYNC_PAUSE() __asm__ __volatile__("yield")
+#else
+#define FLECS_SYNC_PAUSE() ((void)0)
+#endif
+
+/* Bounded spin before parking: ~70-150 us of pause instructions depending on the core. Long enough to span
+ * the serial work between two multi_threaded ops of one tick; short enough that workers park between ticks
+ * instead of burning a core each for the whole frame. */
+#define FLECS_SYNC_SPIN (4096)
+
+static int32_t flecs_sync_load(
+    const int32_t *value)
+{
+    return *(const volatile int32_t*)value;
+}
+
+/* Worker: wait until the main thread releases the next op (sync_epoch moves past `epoch`). */
+static void flecs_worker_wait_release(
+    ecs_world_t *world,
+    int32_t epoch)
+{
+    int32_t i;
+    for (i = 0; i < FLECS_SYNC_SPIN; i ++) {
+        if (flecs_sync_load(&world->sync_epoch) != epoch) {
+            return;
+        }
+        FLECS_SYNC_PAUSE();
+    }
+
+    ecs_os_mutex_lock(world->sync_mutex);
+    ecs_os_ainc(&world->sync_parked);
+    while (flecs_sync_load(&world->sync_epoch) == epoch) {
+        ecs_os_cond_wait(world->worker_cond, world->sync_mutex);
+    }
+    ecs_os_adec(&world->sync_parked);
+    ecs_os_mutex_unlock(world->sync_mutex);
+}
+
 /* Synchronize workers */
 static void flecs_sync_worker(
     ecs_world_t* world)
@@ -65317,16 +65388,21 @@ static void flecs_sync_worker(
         return;
     }
 
-    /* Signal that thread is waiting */
-    ecs_os_mutex_lock(world->sync_mutex);
-    if (++world->workers_waiting == (stage_count - 1)) {
-        /* Only signal main thread when all threads are waiting */
-        ecs_os_cond_signal(world->sync_cond);
+    /* 🚨 Read the epoch BEFORE reporting done. The last worker's report lets the main thread release the NEXT
+     * op at once; a worker that read the epoch after its report could read that new epoch and then wait for
+     * the one after it -- sleeping through an op the main thread is blocked on. */
+    const int32_t epoch = flecs_sync_load(&world->sync_epoch);
+
+    if (ecs_os_ainc(&world->sync_done) == (stage_count - 1)) {
+        /* Last one in: wake the main thread only if it gave up spinning. */
+        if (flecs_sync_load(&world->sync_main_parked) != 0) {
+            ecs_os_mutex_lock(world->sync_mutex);
+            ecs_os_cond_signal(world->sync_cond);
+            ecs_os_mutex_unlock(world->sync_mutex);
+        }
     }
 
-    /* Wait until main thread signals that thread can continue */
-    ecs_os_cond_wait(world->worker_cond, world->sync_mutex);
-    ecs_os_mutex_unlock(world->sync_mutex);
+    flecs_worker_wait_release(world, epoch);
 }
 
 /* Worker thread */
@@ -65340,15 +65416,16 @@ static void* flecs_worker(void *arg) {
     ecs_dbg_2("worker %d: start", stage->id);
 
     /* Start worker, increase counter so main thread knows how many
-     * workers are ready */
+     * workers are ready. The epoch is read under the same lock: the main thread only releases after it has
+     * seen every worker running (flecs_wait_for_workers), so this is the epoch BEFORE the first release. */
     ecs_os_mutex_lock(world->sync_mutex);
     world->workers_running ++;
+    const int32_t start_epoch = flecs_sync_load(&world->sync_epoch);
+    ecs_os_mutex_unlock(world->sync_mutex);
 
     if (!(world->flags & EcsWorldQuitWorkers)) {
-        ecs_os_cond_wait(world->worker_cond, world->sync_mutex);
+        flecs_worker_wait_release(world, start_epoch);
     }
-
-    ecs_os_mutex_unlock(world->sync_mutex);
 
     while (!(world->flags & EcsWorldQuitWorkers)) {
         ecs_entity_t old_scope = ecs_set_scope((ecs_world_t*)stage, 0);
@@ -65444,17 +65521,29 @@ void flecs_wait_for_sync(
 
     ecs_dbg_3("#[bold]pipeline: waiting for worker sync");
 
-    ecs_os_mutex_lock(world->sync_mutex);
-    if (world->workers_waiting != (stage_count - 1)) {
-        ecs_os_cond_wait(world->sync_cond, world->sync_mutex);
+    const int32_t target = stage_count - 1;
+    int32_t i;
+    bool synced = false;
+    for (i = 0; i < FLECS_SYNC_SPIN; i ++) {
+        if (flecs_sync_load(&world->sync_done) == target) {
+            synced = true;
+            break;
+        }
+        FLECS_SYNC_PAUSE();
+    }
+    if (!synced) {
+        ecs_os_mutex_lock(world->sync_mutex);
+        ecs_os_ainc(&world->sync_main_parked);
+        while (flecs_sync_load(&world->sync_done) != target) {
+            ecs_os_cond_wait(world->sync_cond, world->sync_mutex);
+        }
+        ecs_os_adec(&world->sync_main_parked);
+        ecs_os_mutex_unlock(world->sync_mutex);
     }
 
-    /* We shouldn't have been signalled unless all workers are waiting on sync */
-    ecs_assert(world->workers_waiting == (stage_count - 1), 
-        ECS_INTERNAL_ERROR, NULL);
-
-    world->workers_waiting = 0;
-    ecs_os_mutex_unlock(world->sync_mutex);
+    /* Every worker has reported and none can report again before the next release, whose ainc on
+     * sync_epoch fences this store. */
+    world->sync_done = 0;
 
     ecs_dbg_3("#[bold]pipeline: workers synced");
 }
@@ -65469,9 +65558,13 @@ void flecs_signal_workers(
     }
 
     ecs_dbg_3("#[bold]pipeline: signal workers");
-    ecs_os_mutex_lock(world->sync_mutex);
-    ecs_os_cond_broadcast(world->worker_cond);
-    ecs_os_mutex_unlock(world->sync_mutex);
+    ecs_os_ainc(&world->sync_epoch);
+    /* Spinning workers see the epoch move on their own; only parked ones need the condvar. */
+    if (flecs_sync_load(&world->sync_parked) != 0) {
+        ecs_os_mutex_lock(world->sync_mutex);
+        ecs_os_cond_broadcast(world->worker_cond);
+        ecs_os_mutex_unlock(world->sync_mutex);
+    }
 }
 
 void flecs_join_worker_threads(
@@ -65515,6 +65608,7 @@ void flecs_join_worker_threads(
     }
 
     world->flags &= ~EcsWorldQuitWorkers;
+    world->sync_done = 0;
     ecs_assert(world->workers_running == 0, ECS_INTERNAL_ERROR, NULL);
 }
 
