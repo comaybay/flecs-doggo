@@ -15,6 +15,11 @@ typedef struct ecs_pipeline_op_t {
     int32_t count;              /* Number of systems to run before next op */
     double time_spent;          /* Time spent merging commands for sync point */
     int64_t commands_enqueued;  /* Number of commands enqueued for sync point */
+    /* [native_faith fork] Wall time of the op: its systems on every stage plus the
+     * worker sync, excluding the command merge (time_spent). Only accumulated while
+     * ecs_measure_system_time() is on. A multi-threaded system's time_spent is CPU
+     * summed over the workers; this is what the tick actually paid. */
+    double wall_spent;
     bool multi_threaded;        /* Whether systems can be run multi-threaded */
     bool immediate;           /* Whether systems run in immediate mode */
 } ecs_pipeline_op_t;

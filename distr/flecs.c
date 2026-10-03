@@ -4080,6 +4080,11 @@ typedef struct ecs_pipeline_op_t {
     int32_t count;              /* Number of systems to run before next op */
     double time_spent;          /* Time spent merging commands for sync point */
     int64_t commands_enqueued;  /* Number of commands enqueued for sync point */
+    /* [native_faith fork] Wall time of the op: its systems on every stage plus the
+     * worker sync, excluding the command merge (time_spent). Only accumulated while
+     * ecs_measure_system_time() is on. A multi-threaded system's time_spent is CPU
+     * summed over the workers; this is what the tick actually paid. */
+    double wall_spent;
     bool multi_threaded;        /* Whether systems can be run multi-threaded */
     bool immediate;           /* Whether systems run in immediate mode */
 } ecs_pipeline_op_t;
@@ -64543,6 +64548,7 @@ static bool flecs_pipeline_build(
                 op->immediate = false;
                 op->time_spent = 0;
                 op->commands_enqueued = 0;
+                op->wall_spent = 0;
             }
 
             /* Don't increase count for inactive systems, as they are ignored by
@@ -64844,6 +64850,9 @@ void flecs_run_pipeline(
         if (measure_time) {
             ecs_time_measure(&st);
         }
+        /* [native_faith fork] ecs_time_measure advances its argument, so the op's start
+         * is kept apart for wall_spent. */
+        const ecs_time_t op_start = st;
 
         const int32_t i = flecs_run_pipeline_ops(
             world, stage, stage_index, stage_count, delta_time);
@@ -64855,6 +64864,10 @@ void flecs_run_pipeline(
 
         if (op_multi_threaded) {
             flecs_wait_for_sync(world);
+        }
+        if (measure_time) {
+            ecs_time_t t = op_start;
+            pq->cur_op->wall_spent += ecs_time_measure(&t);
         }
 
         if (!immediate) {
@@ -65053,7 +65066,18 @@ char* ecs_pipeline_ops_str(
         " tagged EcsEmpty and excluded from the schedule, so this list shrinks when nothing"
         " of a given kind is alive. merge_ms_total/commands_total cover exactly frames_measured"
         " frames (since the last rebuild or ecs_pipeline_ops_reset_counters); divide by it for"
-        " per-tick cost.\n");
+        " per-tick cost. wall_ms_total is the op's wall time (systems on every stage + worker"
+        " sync, merge excluded) -- what the tick paid, where a multi-threaded system's own time"
+        " is CPU summed over workers. merge_ms and wall_ms need ecs_measure_system_time().\n");
+    {
+        double wall_all = 0;
+        for (i = 0; i < op_count; i ++) {
+            wall_all += ecs_vec_get_t(ops, ecs_pipeline_op_t, i)->wall_spent;
+        }
+        ecs_strbuf_appendlit(&buf, "  wall_ms_total (all ops) ");
+        ecs_strbuf_append(&buf, "%.4f", wall_all * 1000.0);
+        ecs_strbuf_appendlit(&buf, "\n");
+    }
 
     for (i = 0; i < op_count; i ++) {
         ecs_pipeline_op_t *op = ecs_vec_get_t(ops, ecs_pipeline_op_t, i);
@@ -65072,6 +65096,8 @@ char* ecs_pipeline_ops_str(
         ecs_strbuf_appendint(&buf, op->commands_enqueued);
         ecs_strbuf_appendlit(&buf, ", merge_ms_total ");
         ecs_strbuf_append(&buf, "%.4f", op->time_spent * 1000.0);
+        ecs_strbuf_appendlit(&buf, ", wall_ms_total ");
+        ecs_strbuf_append(&buf, "%.4f", op->wall_spent * 1000.0);
         ecs_strbuf_appendlit(&buf, "\n");
 
         for (s = 0; s < op->count; s ++) {
@@ -65125,6 +65151,7 @@ void ecs_pipeline_ops_reset_counters(
         ecs_pipeline_op_t *op = ecs_vec_get_t(ops, ecs_pipeline_op_t, i);
         op->time_spent = 0;
         op->commands_enqueued = 0;
+        op->wall_spent = 0;
     }
 
     pq->counters_since_frame = ecs_get_world_info(cworld)->frame_count_total;

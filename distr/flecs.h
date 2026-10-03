@@ -14114,8 +14114,11 @@ ecs_entity_t ecs_get_pipeline(
  * from a release build. The op schedule is built lazily, so call this only AFTER at
  * least one ecs_progress()/world::progress(); before that the result is empty.
  *
- * \c commands_enqueued is always accumulated; \c merge_ms is only populated when
- * ecs_measure_system_time() is enabled.
+ * \c commands_enqueued is always accumulated; \c merge_ms and \c wall_ms are only
+ * populated when ecs_measure_system_time() is enabled. \c wall_ms is each op's wall
+ * time (systems on every stage plus the worker sync, merge excluded) -- the per-tick
+ * cost of the op, where a multi-threaded system's own time_spent is CPU summed over
+ * the workers.
  *
  * @param world The world.
  * @param pipeline The pipeline to describe, or 0 for the world's current pipeline.
@@ -14128,7 +14131,7 @@ char* ecs_pipeline_ops_str(
     ecs_entity_t pipeline);
 
 /** Zero a pipeline's per-op counters and restart its measurement window.
- * [native_faith fork] Resets every op's time_spent / commands_enqueued and stamps the
+ * [native_faith fork] Resets every op's time_spent / commands_enqueued / wall_spent and stamps the
  * current frame, so the next ecs_pipeline_ops_str() reports cost over exactly the frames
  * since this call rather than a session average. Call it at the start of the interval you
  * want to measure (e.g. just before ramping load), then dump at the end.
